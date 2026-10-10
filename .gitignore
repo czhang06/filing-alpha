@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Cached downloads and derived data. Everything here is reproducible by
+# re-running the pipeline, so it stays out of the repo.
+data/raw/
+data/cache/
+data/interim/
+
+# Final result tables and figures ARE committed (see reports/).
