@@ -12,3 +12,6 @@ data/cache/
 data/interim/
 
 # Final result tables and figures ARE committed (see reports/).
+
+# Editable-install build metadata
+*.egg-info/
