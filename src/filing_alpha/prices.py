@@ -45,20 +45,39 @@ class WindowConfig:
         return f"[{start:+d},{end:+d}]"
 
 
+def select_cached(cached: pd.DataFrame, needed: list[str]) -> pd.DataFrame | None:
+    """Pick usable columns out of a cached price frame, or None if unusable.
+
+    The market proxy must survive: every abnormal return is measured against
+    it, so a cache missing SPY is worse than no cache at all. Individual
+    tickers may legitimately be absent (delisted, bad symbol) and are simply
+    dropped -- the event study already skips tickers with no price series.
+    """
+    if MARKET_PROXY not in cached.columns:
+        return None
+    available = [ticker for ticker in needed if ticker in cached.columns]
+    if len(available) < 2:  # nothing but the proxy is not worth returning
+        return None
+    return cached[available]
+
+
 def download_prices(
     tickers: list[str], start: str, end: str, cache_dir: Path | None = None, batch_size: int = 100
 ) -> pd.DataFrame:
-    """Adjusted close prices, one column per ticker. Requires yfinance."""
-    import yfinance as yf
+    """Adjusted close prices, one column per ticker, always including the market proxy."""
+    needed = sorted(set(tickers) | {MARKET_PROXY})
 
     cache_path = cache_dir / f"prices_{start}_{end}.parquet" if cache_dir else None
     if cache_path and cache_path.exists():
-        cached = pd.read_parquet(cache_path)
-        if set(tickers).issubset(cached.columns):
-            return cached[tickers]
+        usable = select_cached(pd.read_parquet(cache_path), needed)
+        if usable is not None:
+            return usable
+        print("  cached prices unusable (market proxy missing); re-downloading")
+
+    import yfinance as yf
 
     frames = []
-    unique = sorted(set(tickers) | {MARKET_PROXY})
+    unique = needed
     for i in range(0, len(unique), batch_size):
         batch = unique[i : i + batch_size]
         print(f"  prices {i + 1}-{min(i + batch_size, len(unique))} of {len(unique)}", flush=True)

@@ -20,7 +20,13 @@ import numpy as np
 import pandas as pd
 
 from . import edgar, prices as prices_mod, stats as stats_mod
-from .edgar import SecClient, collect_filings, diagnose_acceptance_hours, load_ticker_map
+from .edgar import (
+    SecClient,
+    check_eastern_distribution,
+    collect_filings,
+    diagnose_acceptance_hours,
+    load_ticker_map,
+)
 from .eventstudy import InsufficientData, run_event
 from .prices import WindowConfig
 from .scoring import build_scorer
@@ -64,7 +70,10 @@ def stage_filings(args, client: SecClient, data_dir: Path) -> pd.DataFrame:
     print(f"  {report.summary()}")
 
     hours = diagnose_acceptance_hours(filings)
-    print(f"  acceptance-hour histogram (expect a business-hours shape): {hours}")
+    verdict = check_eastern_distribution(hours["eastern"])
+    print(f"  acceptance hours (UTC):     {hours['utc']}")
+    print(f"  acceptance hours (Eastern): {hours['eastern']}")
+    print(f"  timezone check: {verdict}")
 
     rows = []
     for f in filings:
@@ -86,7 +95,7 @@ def stage_filings(args, client: SecClient, data_dir: Path) -> pd.DataFrame:
     out.parent.mkdir(parents=True, exist_ok=True)
     frame.to_parquet(out)
     (data_dir / "interim" / "ingestion_report.json").write_text(
-        json.dumps({**asdict(report), "acceptance_hours": hours}, indent=2), encoding="utf-8"
+        json.dumps({**asdict(report), "acceptance_hours": hours, "timezone_check": verdict}, indent=2), encoding="utf-8"
     )
     return frame
 
@@ -244,11 +253,13 @@ def stage_analysis(args, events: pd.DataFrame, report_dir: Path) -> pd.DataFrame
         for name, subset in _slices(in_window, args.min_events):
             if len(subset) < args.min_events:
                 continue
+            scars = subset["scar"].to_numpy()
             result = stats_mod.analyse(
                 subset["car"].to_numpy(),
-                subset["scar"].to_numpy(),
+                scars,
                 estimation_days=int(subset["estimation_days"].median()),
             )
+            spread = stats_mod.dispersion(scars)
             rows.append(
                 {
                     "slice": name,
@@ -263,6 +274,10 @@ def stage_analysis(args, events: pd.DataFrame, report_dir: Path) -> pd.DataFrame
                     "bmp_p": result.p_values["bmp"],
                     "sign_p": result.p_values["sign"],
                     "mde": result.minimum_detectable_effect,
+                    "abs_ratio": spread.abs_ratio,
+                    "variance_ratio": spread.variance_ratio,
+                    "abs_p": spread.abs_test.p_value,
+                    "variance_p": spread.variance_test.p_value,
                 }
             )
 
@@ -271,8 +286,13 @@ def stage_analysis(args, events: pd.DataFrame, report_dir: Path) -> pd.DataFrame
         print("  no slices met the minimum event count")
         return table
 
-    # One FDR correction across every test performed, which is the whole point.
+    # FDR within each family of hypotheses. Direction (mean CAR) and magnitude
+    # (variance) are different questions, so they are corrected separately
+    # rather than pooled -- pooling would penalise each for the other's tests.
     table["significant_fdr"] = stats_mod.benjamini_hochberg(table["bmp_p"].to_numpy(), q=args.fdr_q)
+    table["variance_fdr"] = stats_mod.benjamini_hochberg(
+        table["variance_p"].to_numpy(), q=args.fdr_q
+    )
     table = table.sort_values(["window", "slice"]).reset_index(drop=True)
 
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -283,23 +303,34 @@ def stage_analysis(args, events: pd.DataFrame, report_dir: Path) -> pd.DataFrame
 
 def render_report(table: pd.DataFrame, events: pd.DataFrame, args) -> str:
     n_tests = len(table)
-    n_sig = int(table["significant_fdr"].sum())
+    n_direction = int(table["significant_fdr"].sum())
+    n_variance = int(table["variance_fdr"].sum())
     lines = [
         "# Do 8-K filings move prices?",
         "",
         f"- Events: **{events['accession'].nunique():,}** filings, "
         f"**{events['ticker'].nunique():,}** tickers, {args.start} to {args.end}",
         f"- Observations: {len(events):,} (filing x event window)",
-        f"- Tests run: {n_tests}; significant after Benjamini-Hochberg at q={args.fdr_q}: **{n_sig}**",
+        f"- Market-model estimation window: [{args.estimation_start}, {args.estimation_end}] "
+        "trading days; market proxy SPY",
         f"- Sentiment backend: {args.scorer or 'none'}",
         "",
-        "`mean_car` is the average cumulative abnormal return versus a market model "
-        "estimated over "
-        f"[{args.estimation_start}, {args.estimation_end}] trading days. `mde` is the smallest "
-        "true effect this sample could have detected at 80% power -- a null result is only "
-        "meaningful next to it.",
+        "Two different questions are asked of the same events:",
         "",
-        "## Results",
+        f"1. **Direction** -- does the filing push the price up or down on average? "
+        f"{n_direction} of {n_tests} tests significant after Benjamini-Hochberg at q={args.fdr_q}.",
+        f"2. **Magnitude** -- does the filing make the price move *more*, in either direction? "
+        f"{n_variance} of {n_tests} tests significant at the same threshold.",
+        "",
+        "The distinction matters. For earnings releases roughly half the surprises are good and "
+        "half are bad, so the signed average can sit at zero even when every announcement moves "
+        "the stock several percent. A mean test is structurally blind to that; the variance test "
+        "is not.",
+        "",
+        "## 1. Direction: mean cumulative abnormal return",
+        "",
+        "`mde` is the smallest true effect this sample could have detected at 80% power. A null "
+        "result is only meaningful next to it.",
         "",
         "| Slice | Window | n | Mean CAR | 95% CI | % positive | BMP p | FDR sig | MDE |",
         "|---|---|---:|---:|---|---:|---:|:-:|---:|",
@@ -310,17 +341,39 @@ def render_report(table: pd.DataFrame, events: pd.DataFrame, args) -> str:
             f"[{row.ci_low * 100:+.3f}%, {row.ci_high * 100:+.3f}%] | {row.pct_positive * 100:.1f}% | "
             f"{row.bmp_p:.4f} | {'yes' if row.significant_fdr else 'no'} | {row.mde * 100:.3f}% |"
         )
+
+    lines += [
+        "",
+        "## 2. Magnitude: was the move bigger than a normal day?",
+        "",
+        "Both ratios are 1.00 on an ordinary day. `|AR| ratio` is mean absolute standardized "
+        "abnormal return against its no-event expectation; `var ratio` is mean squared "
+        "standardized abnormal return, so 2.00 means twice the usual return variance. Tests are "
+        "one-sided: an unusually *calm* day is not evidence of a reaction.",
+        "",
+        "| Slice | Window | n | \\|AR\\| ratio | Var ratio | Variance p | FDR sig |",
+        "|---|---|---:|---:|---:|---:|:-:|",
+    ]
+    for row in table.sort_values("variance_p").itertuples():
+        lines.append(
+            f"| {row.slice} | {row.window} | {row.n:,} | {row.abs_ratio:.2f}x | "
+            f"{row.variance_ratio:.2f}x | {row.variance_p:.2e} | "
+            f"{'yes' if row.variance_fdr else 'no'} |"
+        )
+
     lines += [
         "",
         "## How to read this",
         "",
-        "A row is evidence of a real price reaction only if the BMP p-value survives the FDR "
-        "column. An uncorrected p below 0.05 means little here: with this many slices, several "
-        "will clear that bar by chance alone.",
+        "A row is evidence only if its p-value survives the FDR column. An uncorrected p below "
+        "0.05 means little with this many slices: several will clear that bar by chance alone.",
         "",
-        "If nothing survives, the honest conclusion is that filings of this kind produced no "
-        "detectable abnormal return at this sample size -- and the MDE column says how large an "
-        "effect would have been needed to show up.",
+        "Where the direction table is null but the variance table is not, the reading is that "
+        "filings reliably move prices without being predictable in sign -- consistent with the "
+        "market pricing the news in, rather than with a tradeable signal.",
+        "",
+        "Nothing here is a strategy. Abnormal returns ignore spreads, market impact and borrow "
+        "costs, and the variance result in particular is not directional.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -370,8 +423,12 @@ def main(argv=None) -> int:
     if not table.empty:
         print(f"\nWrote {args.report_dir / 'results.md'} and results.csv")
         print(
-            f"{int(table['significant_fdr'].sum())} of {len(table)} tests significant "
-            f"after FDR correction at q={args.fdr_q}"
+            f"direction: {int(table['significant_fdr'].sum())} of {len(table)} significant "
+            f"after FDR at q={args.fdr_q}"
+        )
+        print(
+            f"magnitude: {int(table['variance_fdr'].sum())} of {len(table)} significant "
+            f"after FDR at q={args.fdr_q}"
         )
     return 0
 

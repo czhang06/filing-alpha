@@ -1,3 +1,2 @@
--r requirements.txt
-torch>=2.2
-transformers>=4.40
+# Everything above plus the FinBERT scorer (torch, ~500 MB of model weights).
+-e .[dev,finbert]

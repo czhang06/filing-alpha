@@ -1,0 +1,2 @@
+[console_scripts]
+filing-alpha = filing_alpha.pipeline:main

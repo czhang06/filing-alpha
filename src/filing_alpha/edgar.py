@@ -20,11 +20,14 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterator
 
 import requests
+
+EASTERN = ZoneInfo("America/New_York")  # the exchange timezone, DST-aware
 
 SEC_RATE_LIMIT_PER_SECOND = 8.0  # SEC allows 10; leave headroom
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -139,34 +142,50 @@ class Filing:
             cik=self.cik, accession_nodash=self.accession_nodash, document=self.primary_document
         )
 
+    def eastern(self) -> datetime | None:
+        """Acceptance time converted to US/Eastern, the exchange's timezone."""
+        if self.accepted_at is None:
+            return None
+        return self.accepted_at.astimezone(EASTERN)
+
     def event_date(self, market_close_hour: int = 16) -> str:
         """Calendar date the filing should be attributed to.
 
-        A filing accepted after the 16:00 close cannot move that day's closing
-        price, so it belongs to the next session. Getting this wrong shifts
-        every after-hours filing by a day, which is the most common silent bug
-        in event studies -- and roughly half of all 8-Ks are filed after hours.
+        A filing accepted after the 16:00 Eastern close cannot move that day's
+        closing price, so it belongs to the next session. Getting this wrong
+        shifts affected filings by a day, which is the most common silent bug
+        in event studies -- and well over half of all 8-Ks are accepted outside
+        market hours.
 
-        Timezone note: EDGAR's ``acceptanceDateTime`` is written with a ``Z``
-        suffix but is US/Eastern wall-clock time, not UTC. We therefore read the
-        hour as Eastern directly. ``diagnose_acceptance_hours`` prints the
-        distribution so this can be confirmed against real data rather than
-        taken on faith -- as Eastern it should cluster in business hours with a
-        spike just after 16:00; as UTC it would sit implausibly overnight.
+        Timezone: EDGAR's ``acceptanceDateTime`` is **UTC**, despite being a
+        wall-clock-looking string. This was confirmed empirically rather than
+        assumed -- see ``diagnose_acceptance_hours``: the raw hour distribution
+        is empty between 06:00 and 09:00 and peaks at 20:00-21:00, which is
+        only coherent as UTC (01:00-04:00 ET dead zone, 15:00-16:00 ET close).
+        Reading it as Eastern misdated most of the sample.
+
+        DST is handled by ``zoneinfo`` rather than a fixed offset, so filings
+        in the changeover weeks land in the right session.
 
         This returns a calendar date. Mapping it onto the next *trading* day
         (weekends, holidays) happens in ``prices.py``, which knows the exchange
         calendar implied by the price series.
         """
-        if self.accepted_at is None:
+        local = self.eastern()
+        if local is None:
             return self.filed_date
-        if self.accepted_at.hour >= market_close_hour:
-            return _next_calendar_day(self.filed_date)
-        return self.filed_date
+        if local.hour >= market_close_hour:
+            return (local.date() + timedelta(days=1)).isoformat()
+        return local.date().isoformat()
 
     @property
     def after_hours(self) -> bool:
-        return self.accepted_at is not None and self.accepted_at.hour >= 16
+        """True when the filing landed outside 09:30-16:00 Eastern."""
+        local = self.eastern()
+        if local is None:
+            return False
+        minutes = local.hour * 60 + local.minute
+        return not (9 * 60 + 30 <= minutes < 16 * 60)
 
 
 def _next_calendar_day(date_str: str) -> str:
@@ -177,38 +196,53 @@ def _next_calendar_day(date_str: str) -> str:
 
 
 def _parse_accepted(value: str | None) -> datetime | None:
-    """Parse EDGAR's acceptance timestamp as naive US/Eastern wall-clock time.
+    """Parse EDGAR's acceptance timestamp as UTC.
 
-    EDGAR emits e.g. "2026-02-11T16:31:02.000Z". The trailing Z is misleading --
-    the clock reading is Eastern. We strip any offset and keep the wall-clock
-    reading rather than converting, because converting would move every
-    after-hours filing into the wrong session.
+    EDGAR emits e.g. "2026-02-11T21:31:02.000Z". The value is genuinely UTC;
+    this was verified against the real hour distribution (see
+    ``diagnose_acceptance_hours``) rather than assumed from the format.
     """
     if not value:
         return None
-    cleaned = value.strip().rstrip("Z")
-    for suffix_len in (6, 0):  # tolerate a trailing +00:00 style offset
-        candidate = cleaned[:-suffix_len] if suffix_len else cleaned
-        try:
-            return datetime.fromisoformat(candidate).replace(tzinfo=None)
-        except ValueError:
-            continue
-    return None
+    cleaned = value.strip()
+    candidate = cleaned[:-1] if cleaned.endswith("Z") else cleaned
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def diagnose_acceptance_hours(filings: list["Filing"]) -> dict[int, int]:
-    """Histogram of acceptance hours, to confirm the Eastern-time reading.
+def diagnose_acceptance_hours(filings: list["Filing"]) -> dict[str, dict[int, int]]:
+    """Acceptance-hour histograms in UTC and Eastern, as a sanity check.
 
-    Expect a business-hours shape with a pronounced spike at 16:00-18:00 (the
-    post-close earnings window). A flat overnight distribution would mean the
-    timestamps are not what we assume and ``_parse_accepted`` needs revisiting.
+    EDGAR accepts filings roughly 06:00-22:00 Eastern, so the ``eastern``
+    histogram should be empty overnight and peak around the 16:00 close. If it
+    is not, the timezone handling in ``_parse_accepted`` is wrong and every
+    event date is suspect. This check is what caught the original bug.
     """
-    histogram: dict[int, int] = {}
+    utc: dict[int, int] = {}
+    eastern: dict[int, int] = {}
     for filing in filings:
-        if filing.accepted_at is not None:
-            hour = filing.accepted_at.hour
-            histogram[hour] = histogram.get(hour, 0) + 1
-    return dict(sorted(histogram.items()))
+        if filing.accepted_at is None:
+            continue
+        utc[filing.accepted_at.hour] = utc.get(filing.accepted_at.hour, 0) + 1
+        local = filing.eastern()
+        eastern[local.hour] = eastern.get(local.hour, 0) + 1
+    return {"utc": dict(sorted(utc.items())), "eastern": dict(sorted(eastern.items()))}
+
+
+def check_eastern_distribution(histogram: dict[int, int]) -> str:
+    """One-line verdict on whether the Eastern histogram looks plausible."""
+    overnight = sum(count for hour, count in histogram.items() if 1 <= hour <= 4)
+    total = sum(histogram.values()) or 1
+    share = overnight / total
+    if share > 0.05:
+        return (
+            f"WARNING: {share:.1%} of filings land 01:00-04:00 Eastern, which is "
+            "implausible. Timezone handling is probably wrong."
+        )
+    return f"OK: only {share:.1%} of filings land 01:00-04:00 Eastern, as expected."
 
 
 def iter_company_8ks(

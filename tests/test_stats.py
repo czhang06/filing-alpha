@@ -13,7 +13,10 @@ import pytest
 from scipy import stats as scipy_stats
 
 from filing_alpha.stats import (
+    EXPECTED_ABS_STANDARD_NORMAL,
+    abs_return_test,
     analyse,
+    dispersion,
     benjamini_hochberg,
     bmp_test,
     bootstrap_ci,
@@ -21,6 +24,7 @@ from filing_alpha.stats import (
     patell_z,
     sign_test,
     ttest_mean_car,
+    variance_ratio_test,
 )
 
 SEED = 20261010
@@ -227,3 +231,59 @@ class TestAnalyse:
         assert result.p_values["t"] < 1e-6
         assert result.p_values["bmp"] < 1e-6
         assert result.p_values["sign"] < 1e-6
+
+
+class TestDispersion:
+    """The tests that ask 'did the stock move MORE', not 'did it move UP'."""
+
+    def test_no_event_day_has_ratios_of_one(self):
+        rng = np.random.default_rng(SEED)
+        scars = rng.normal(0, 1, 4000)  # exactly the null
+        result = dispersion(scars)
+        assert result.abs_ratio == pytest.approx(1.0, abs=0.05)
+        assert result.variance_ratio == pytest.approx(1.0, abs=0.08)
+        assert result.abs_test.p_value > 0.05
+        assert result.variance_test.p_value > 0.05
+
+    def test_detects_inflated_volatility_with_zero_mean(self):
+        """The key case: no directional effect at all, but twice the spread.
+
+        A mean-CAR test sees nothing here. The dispersion tests should see it
+        clearly -- doubling the standard deviation quadruples the variance.
+        """
+        rng = np.random.default_rng(SEED)
+        scars = rng.normal(0, 2.0, 2000)
+        result = dispersion(scars)
+
+        assert result.variance_ratio == pytest.approx(4.0, rel=0.15)
+        assert result.abs_ratio == pytest.approx(2.0, rel=0.10)
+        assert result.variance_test.p_value < 1e-10
+        assert result.abs_test.p_value < 1e-10
+        # and confirm the mean test is blind to it
+        assert bmp_test(scars).p_value > 0.05
+
+    def test_expected_absolute_value_constant_is_right(self):
+        """sqrt(2/pi) is E|Z| for a standard normal; check against simulation."""
+        rng = np.random.default_rng(SEED)
+        assert EXPECTED_ABS_STANDARD_NORMAL == pytest.approx(0.7978845608, abs=1e-9)
+        assert float(np.abs(rng.normal(0, 1, 200_000)).mean()) == pytest.approx(
+            EXPECTED_ABS_STANDARD_NORMAL, abs=0.01
+        )
+
+    def test_is_one_sided(self):
+        """Unusually *calm* event days are not evidence of a reaction."""
+        rng = np.random.default_rng(SEED)
+        quiet = rng.normal(0, 0.5, 2000)
+        result = dispersion(quiet)
+        assert result.variance_ratio < 1.0
+        assert result.variance_test.p_value > 0.9  # one-sided, so no rejection
+
+    def test_degenerate_input_is_safe(self):
+        result = dispersion([0.5])
+        assert np.isnan(result.abs_test.p_value)
+        assert np.isnan(result.variance_test.p_value)
+
+    def test_ignores_non_finite_values(self):
+        scars = np.array([1.0, -1.0, np.nan, 2.0, np.inf])
+        assert abs_return_test(scars)[0].n == 3
+        assert variance_ratio_test(scars)[0].n == 3

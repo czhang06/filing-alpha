@@ -115,6 +115,77 @@ def sign_test(cars) -> TestResult:
     return TestResult("sign test", float(positives / n), float(result.pvalue), n)
 
 
+# Under the null, SCARs are standard normal (verified in test_eventstudy.py),
+# so E[|SCAR|] = sqrt(2/pi) and E[SCAR^2] = 1. Those are the no-event baselines
+# the dispersion tests below measure against.
+EXPECTED_ABS_STANDARD_NORMAL = float(np.sqrt(2.0 / np.pi))
+
+
+@dataclass(frozen=True)
+class DispersionResult:
+    """Did the event make the stock move *more*, regardless of direction?
+
+    This is the question a mean-CAR test cannot answer. For earnings releases
+    roughly half the surprises are good and half bad, so the signed average is
+    near zero by construction even when every single announcement moves the
+    stock several percent. Dispersion is where that effect lives.
+    """
+
+    n: int
+    abs_ratio: float  # mean|SCAR| / sqrt(2/pi); 1.0 means a normal day
+    variance_ratio: float  # mean SCAR^2; 1.0 means a normal day
+    abs_test: TestResult
+    variance_test: TestResult
+
+
+def abs_return_test(scars) -> tuple[TestResult, float]:
+    """One-sided test that mean |SCAR| exceeds its no-event expectation."""
+    values = np.abs(_clean(scars))
+    n = values.size
+    if n < 2:
+        return TestResult("|SCAR| vs no-event", float("nan"), float("nan"), n), float("nan")
+    ratio = float(values.mean() / EXPECTED_ABS_STANDARD_NORMAL)
+    spread = values.std(ddof=1)
+    if spread <= 0:
+        return TestResult("|SCAR| vs no-event", float("nan"), float("nan"), n), ratio
+    t = float((values.mean() - EXPECTED_ABS_STANDARD_NORMAL) / (spread / np.sqrt(n)))
+    p = float(scipy_stats.t.sf(t, df=n - 1))  # one-sided: only an increase is interesting
+    return TestResult("|SCAR| vs no-event", t, p, n), ratio
+
+
+def variance_ratio_test(scars) -> tuple[TestResult, float]:
+    """One-sided test that event-window return variance exceeds the normal level.
+
+    Tested as a t-test on SCAR^2 rather than a chi-squared test, because
+    returns are fat-tailed and chi-squared assumes normality of the underlying
+    far more strongly than a mean test on the squares does.
+    """
+    values = _clean(scars) ** 2
+    n = values.size
+    if n < 2:
+        return TestResult("variance ratio", float("nan"), float("nan"), n), float("nan")
+    ratio = float(values.mean())
+    spread = values.std(ddof=1)
+    if spread <= 0:
+        return TestResult("variance ratio", float("nan"), float("nan"), n), ratio
+    t = float((ratio - 1.0) / (spread / np.sqrt(n)))
+    p = float(scipy_stats.t.sf(t, df=n - 1))
+    return TestResult("variance ratio", t, p, n), ratio
+
+
+def dispersion(scars) -> DispersionResult:
+    """Run both dispersion tests on one slice."""
+    abs_test, abs_ratio = abs_return_test(scars)
+    var_test, var_ratio = variance_ratio_test(scars)
+    return DispersionResult(
+        n=_clean(scars).size,
+        abs_ratio=abs_ratio,
+        variance_ratio=var_ratio,
+        abs_test=abs_test,
+        variance_test=var_test,
+    )
+
+
 def bootstrap_ci(
     values, confidence: float = 0.95, iterations: int = 10_000, seed: int = 20261010
 ) -> tuple[float, float]:

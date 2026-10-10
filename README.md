@@ -24,10 +24,17 @@ toward zero.
 
 For every filing:
 
-1. **Date it correctly.** EDGAR's acceptance timestamp is Eastern wall-clock
-   time despite its `Z` suffix. Filings accepted after 16:00 cannot move that
-   day's close, so they are attributed to the next session. Roughly half of all
-   8-Ks are filed after hours, so getting this wrong misdates half the sample.
+1. **Date it correctly.** EDGAR's acceptance timestamp is UTC. It is converted
+   to US/Eastern with `zoneinfo` (so DST is handled, not approximated), and
+   filings accepted after the 16:00 Eastern close are attributed to the next
+   session, since they cannot move that day's closing price.
+
+   This was verified, not assumed. The pipeline prints the acceptance-hour
+   histogram in both timezones and flags an implausible one. On the first real
+   run the raw hours were empty between 06:00 and 09:00 and peaked at
+   20:00–21:00 — a shape only coherent as UTC — which caught an initial
+   misreading that had misdated most of the sample by a day. `make_filing`
+   tests in `tests/test_edgar.py` pin the behaviour at both DST offsets.
 2. **Fit a market model** on days −250 to −30 relative to the event:
    `R_it = α_i + β_i·R_mt + ε_it`, with SPY as the market proxy. The window ends
    well before the event so pre-announcement drift cannot contaminate β.
@@ -55,13 +62,16 @@ For every filing:
 python -m venv .venv
 .venv\Scripts\Activate.ps1          # Windows PowerShell
 # source .venv/bin/activate         # macOS/Linux
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
+
+This installs the package in editable mode, which is what puts `filing_alpha`
+on the import path. `pip install -r requirements.txt` does the same thing.
 
 FinBERT is optional and heavy (torch plus ~500 MB of weights):
 
 ```bash
-pip install -r requirements-finbert.txt
+pip install -e ".[dev,finbert]"
 ```
 
 ## Running it
@@ -69,26 +79,24 @@ pip install -r requirements-finbert.txt
 SEC fair-access rules require a real contact address in the User-Agent. The
 client enforces this and throttles to 8 requests/second.
 
+After installing, `filing-alpha` is on your PATH. `python -m filing_alpha.pipeline`
+does the same thing.
+
 ```bash
 # Quick check: 100 companies, no text fetching. A few minutes.
-python -m filing_alpha.pipeline \
-  --user-agent "Your Name you@example.com" \
+filing-alpha --user-agent "Your Name you@example.com" \
   --start 2024-01-01 --end 2025-12-31 \
   --max-companies 100
 
 # Full run with lexicon sentiment. Tens of minutes, mostly EDGAR throttling.
-python -m filing_alpha.pipeline \
-  --user-agent "Your Name you@example.com" \
+filing-alpha --user-agent "Your Name you@example.com" \
   --start 2023-01-01 --end 2025-12-31 \
-  --max-companies 500 \
-  --scorer lexicon
+  --max-companies 500 --scorer lexicon
 
 # Same events through FinBERT, to compare backends.
-python -m filing_alpha.pipeline \
-  --user-agent "Your Name you@example.com" \
+filing-alpha --user-agent "Your Name you@example.com" \
   --start 2023-01-01 --end 2025-12-31 \
-  --max-companies 500 \
-  --scorer finbert
+  --max-companies 500 --scorer finbert
 ```
 
 Results land in `reports/results.md` and `reports/results.csv`.

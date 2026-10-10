@@ -146,7 +146,12 @@ class TestRenderReport:
                 "bmp_p": [0.31],
                 "sign_p": [0.6],
                 "mde": [0.0059],
+                "abs_ratio": [1.02],
+                "variance_ratio": [1.05],
+                "abs_p": [0.4],
+                "variance_p": [0.42],
                 "significant_fdr": [False],
+                "variance_fdr": [False],
             }
         )
         text = render_report(table, events, args)
@@ -162,11 +167,16 @@ class TestRenderReport:
                 "slice": ["All filings"], "window": ["[+0,+0]"], "n": [100],
                 "mean_car": [0.0], "median_car": [0.0], "ci_low": [-0.01], "ci_high": [0.01],
                 "pct_positive": [0.5], "t_p": [0.9], "bmp_p": [0.9], "sign_p": [0.9],
-                "mde": [0.008], "significant_fdr": [False],
+                "mde": [0.008], "abs_ratio": [1.0], "variance_ratio": [1.0],
+                "abs_p": [0.5], "variance_p": [0.5],
+                "significant_fdr": [False], "variance_fdr": [False],
             }
         )
         text = render_report(table, events, default_args())
-        assert "no detectable abnormal return" in text
+        # A null result must be reported next to what it could have detected,
+        # and must not be dressed up as a tradeable finding.
+        assert "smallest true effect this sample could have detected" in text
+        assert "Nothing here is a strategy" in text
 
 
 class TestParseArgs:
@@ -184,3 +194,37 @@ class TestParseArgs:
     def test_rejects_an_unknown_scorer(self):
         with pytest.raises(SystemExit):
             parse_args(["--user-agent", "A a@b.com", "--scorer", "vader"])
+
+
+class TestDispersionReporting:
+    def test_variance_columns_are_produced(self, tmp_path):
+        table = stage_analysis(default_args(), make_events(n=300), tmp_path)
+        for column in ("abs_ratio", "variance_ratio", "variance_p", "variance_fdr"):
+            assert column in table.columns
+
+    def test_normal_days_give_ratios_near_one(self, tmp_path):
+        """make_events draws scar = car/0.03 with car ~ N(0, 0.03), i.e. the null."""
+        table = stage_analysis(default_args(), make_events(n=600), tmp_path)
+        row = table[table["slice"] == "All filings"].iloc[0]
+        assert row["variance_ratio"] == pytest.approx(1.0, abs=0.2)
+        assert not bool(row["variance_fdr"])
+
+    def test_detects_inflated_variance_with_no_directional_effect(self, tmp_path):
+        rng = np.random.default_rng(11)
+        events = make_events(n=600, effect=0.0)
+        # Triple the spread, keep the mean at zero.
+        events["car"] = rng.normal(0.0, 0.09, len(events))
+        events["scar"] = events["car"] / 0.03
+        table = stage_analysis(default_args(), events, tmp_path)
+        row = table[table["slice"] == "All filings"].iloc[0]
+
+        assert row["variance_ratio"] > 5
+        assert bool(row["variance_fdr"])
+        assert not bool(row["significant_fdr"])  # mean test stays blind
+
+    def test_report_contains_both_sections(self, tmp_path):
+        stage_analysis(default_args(), make_events(n=300), tmp_path)
+        text = (tmp_path / "results.md").read_text(encoding="utf-8")
+        assert "## 1. Direction" in text
+        assert "## 2. Magnitude" in text
+        assert "Var ratio" in text

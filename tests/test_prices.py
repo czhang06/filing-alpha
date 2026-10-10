@@ -10,7 +10,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from filing_alpha.prices import WindowConfig, extract_windows, locate_event_index, to_returns
+from filing_alpha.prices import (
+    MARKET_PROXY,
+    WindowConfig,
+    extract_windows,
+    locate_event_index,
+    select_cached,
+    to_returns,
+)
 
 # Weekdays only, so weekends are genuinely absent from the index.
 CALENDAR = pd.bdate_range("2025-01-01", periods=400)
@@ -128,3 +135,38 @@ class TestExtractWindows:
         result = extract_windows(stock, market, 300, WindowConfig(), (0, 0))
         assert result is not None
         assert np.isnan(result[0]).sum() == 1
+
+
+class TestSelectCached:
+    """Regression tests for the cache bug that dropped the market proxy.
+
+    The first run cached SPY correctly; the second returned only the requested
+    tickers, which excluded it, and the event study then had nothing to measure
+    abnormal returns against.
+    """
+
+    def frame(self, columns):
+        return pd.DataFrame({c: [1.0, 2.0, 3.0] for c in columns})
+
+    def test_keeps_the_market_proxy_even_when_not_requested(self):
+        cached = self.frame(["AAPL", "MSFT", MARKET_PROXY])
+        result = select_cached(cached, ["AAPL", "MSFT", MARKET_PROXY])
+        assert MARKET_PROXY in result.columns
+
+    def test_returns_none_when_the_proxy_is_absent(self):
+        cached = self.frame(["AAPL", "MSFT"])
+        assert select_cached(cached, ["AAPL", "MSFT", MARKET_PROXY]) is None
+
+    def test_drops_tickers_the_cache_does_not_have(self):
+        cached = self.frame(["AAPL", MARKET_PROXY])
+        result = select_cached(cached, ["AAPL", "NOPE", MARKET_PROXY])
+        assert list(result.columns) == ["AAPL", MARKET_PROXY]
+
+    def test_returns_none_when_only_the_proxy_survives(self):
+        cached = self.frame([MARKET_PROXY])
+        assert select_cached(cached, ["AAPL", MARKET_PROXY]) is None
+
+    def test_preserves_the_requested_order(self):
+        cached = self.frame([MARKET_PROXY, "MSFT", "AAPL"])
+        result = select_cached(cached, ["AAPL", "MSFT", MARKET_PROXY])
+        assert list(result.columns) == ["AAPL", "MSFT", MARKET_PROXY]
